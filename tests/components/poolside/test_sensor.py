@@ -1,13 +1,15 @@
 """Tests for the Poolside sensors: water temperature and site mode."""
 
+import json
 from typing import Any
 
 from aiopoolside import PoolsideControl, PoolsideSite
 from aiopoolside.const import ControlType, GroupKind
 import pytest
 
-from homeassistant.components.sensor import ATTR_OPTIONS
+from homeassistant.components.sensor import ATTR_OPTIONS, SensorDeviceClass
 from homeassistant.const import (
+    ATTR_DEVICE_CLASS,
     ATTR_UNIT_OF_MEASUREMENT,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
@@ -28,6 +30,7 @@ from tests.common import MockConfigEntry
 ENTITY_ID = "sensor.pool_temperature"
 MODE_ENTITY_ID = "sensor.test_residence_controller_mode"
 WATER_STATE_ENTITY_ID = "sensor.pool_water_state"
+READY_TIME_ENTITY_ID = "sensor.pool_estimated_ready_time"
 DISABLED_REASON_ENTITY_ID = "sensor.pool_heater_disabled_reason"
 
 
@@ -51,13 +54,14 @@ def controls(hass: HomeAssistant) -> list[PoolsideControl]:
 
 @pytest.mark.usefixtures("setup_integration")
 async def test_expected_sensors_created(hass: HomeAssistant) -> None:
-    """Temperature and water state per body of water (none for landscape groups), a disabled reason sensor per control, plus the site mode sensor.
+    """Temperature, water state and ready time per body of water (none for landscape groups), a disabled reason sensor per control, plus the site mode sensor.
 
     Chemistry sensors are absent until their fields are actually reported.
     """
     assert set(hass.states.async_entity_ids("sensor")) == {
         ENTITY_ID,
         WATER_STATE_ENTITY_ID,
+        READY_TIME_ENTITY_ID,
         MODE_ENTITY_ID,
         DISABLED_REASON_ENTITY_ID,
         "sensor.pool_pool_light_disabled_reason",
@@ -192,6 +196,126 @@ async def test_water_state_sensor_reflects_pushes(
     assert state.state == STATE_UNKNOWN
 
 
+# The controller's placeholder for an unset timestamp, as sent on the wire.
+UNSET_DATETIME = "0001-01-01T00:00:00-04:24"
+
+
+def temperature_rise_information(**overrides: Any) -> str:
+    """Build a TemperatureRiseInformation push, shaped like a real controller's."""
+    document: dict[str, Any] = {
+        "HeaterUUIDs": [],
+        "UUID": "rise-1",
+        "HvacMode": "HEATING",
+        "LastCalculatedDateTime": "2026-10-01T09:14:56.5610490-04:00",
+        "LastCalculatedWaterTemperature": 82.655655,
+        "StartTemperature": 82.655655,
+        "TargetTemperature": 102.0,
+        "SetPointChangedOrTStatWasTurnedOff": False,
+        "StartDateTime": "2026-10-01T09:09:39.5644686-04:00",
+        "TargetEndDateTime": "2026-10-01T10:55:56.5610490-04:00",
+        "OriginalTargetEndDateTime": "2026-10-01T10:55:56.5610490-04:00",
+        "ActualEndDateTime": UNSET_DATETIME,
+        "ActualEndTemperature": 0.0,
+        "EstimatedWattNeeded": 0,
+        "EstimatedBTUNeeded": 0,
+        "HeatingEventType": "NORMAL",
+        "TemperatureState": "SAMPLED",
+        "OriginalFutureHeatingEvent": None,
+    }
+    document.update(overrides)
+    return json.dumps(document, indent=2)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected_state"),
+    [
+        pytest.param(
+            temperature_rise_information(),
+            "2026-10-01T14:55:56+00:00",
+            id="predicted",
+        ),
+        pytest.param(
+            temperature_rise_information(
+                TemperatureState="SAMPLING",
+                StartTemperature=None,
+                TargetEndDateTime=UNSET_DATETIME,
+                OriginalTargetEndDateTime=UNSET_DATETIME,
+            ),
+            STATE_UNKNOWN,
+            id="still-sampling",
+        ),
+        pytest.param(
+            temperature_rise_information(
+                ActualEndDateTime="2026-10-01T10:54:10.0000000-04:00"
+            ),
+            STATE_UNKNOWN,
+            id="target-reached",
+        ),
+        pytest.param(
+            temperature_rise_information(TargetEndDateTime=None),
+            STATE_UNKNOWN,
+            id="no-target",
+        ),
+        pytest.param("not json", STATE_UNKNOWN, id="malformed"),
+        pytest.param("[]", STATE_UNKNOWN, id="not-a-document"),
+    ],
+)
+@pytest.mark.usefixtures("setup_integration")
+async def test_ready_time_sensor_reflects_temperature_rise(
+    hass: HomeAssistant,
+    fake_client: FakePoolsideClient,
+    raw_value: str,
+    expected_state: str,
+) -> None:
+    """The ready time is the controller's TargetEndDateTime, unknown while unset."""
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+    assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.TIMESTAMP
+
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID, "TemperatureRiseInformation", raw_value
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == expected_state
+
+
+@pytest.mark.usefixtures("setup_integration")
+async def test_ready_time_sensor_follows_revisions(
+    hass: HomeAssistant,
+    fake_client: FakePoolsideClient,
+) -> None:
+    """Revised predictions update the sensor, and clearing the field resets it."""
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID,
+        "TemperatureRiseInformation",
+        temperature_rise_information(),
+    )
+    await hass.async_block_till_done()
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID,
+        "TemperatureRiseInformation",
+        temperature_rise_information(
+            TargetEndDateTime="2026-10-01T10:54:32.1000000-04:00"
+        ),
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == "2026-10-01T14:54:32+00:00"
+
+    fake_client.set_status(TEST_BODY_OF_WATER_UUID, "TemperatureRiseInformation", None)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+
 @pytest.mark.usefixtures("setup_integration")
 async def test_site_mode_sensor_reflects_pushes(
     hass: HomeAssistant,
@@ -254,6 +378,7 @@ async def test_no_mode_sensor_without_site_uuid(
     assert set(hass.states.async_entity_ids("sensor")) == {
         ENTITY_ID,
         WATER_STATE_ENTITY_ID,
+        READY_TIME_ENTITY_ID,
         DISABLED_REASON_ENTITY_ID,
     }
 
