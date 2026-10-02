@@ -5,6 +5,7 @@ from typing import Any
 
 from aiopoolside import PoolsideControl, PoolsideSite
 from aiopoolside.const import ControlType, GroupKind
+from freezegun.api import FrozenDateTimeFactory
 import pytest
 
 from homeassistant.components.sensor import ATTR_OPTIONS, SensorDeviceClass
@@ -25,7 +26,7 @@ from .conftest import (
     make_group,
 )
 
-from tests.common import MockConfigEntry
+from tests.common import MockConfigEntry, async_fire_time_changed
 
 ENTITY_ID = "sensor.pool_temperature"
 MODE_ENTITY_ID = "sensor.test_residence_controller_mode"
@@ -54,14 +55,13 @@ def controls(hass: HomeAssistant) -> list[PoolsideControl]:
 
 @pytest.mark.usefixtures("setup_integration")
 async def test_expected_sensors_created(hass: HomeAssistant) -> None:
-    """Temperature, water state and ready time per body of water (none for landscape groups), a disabled reason sensor per control, plus the site mode sensor.
+    """Temperature and water state per body of water (none for landscape groups), a disabled reason sensor per control, plus the site mode sensor.
 
-    Chemistry sensors are absent until their fields are actually reported.
+    Chemistry and ready time sensors are absent until their fields are actually reported.
     """
     assert set(hass.states.async_entity_ids("sensor")) == {
         ENTITY_ID,
         WATER_STATE_ENTITY_ID,
-        READY_TIME_ENTITY_ID,
         MODE_ENTITY_ID,
         DISABLED_REASON_ENTITY_ID,
         "sensor.pool_pool_light_disabled_reason",
@@ -198,10 +198,14 @@ async def test_water_state_sensor_reflects_pushes(
 
 # The controller's placeholder for an unset timestamp, as sent on the wire.
 UNSET_DATETIME = "0001-01-01T00:00:00-04:24"
+# During a heat-up captured from a controller: sampled at 9:14:56 AM, ready
+# predicted for 10:55:56 AM.
+NOW = "2026-10-01T09:20:00-04:00"
+PREDICTED = "2026-10-01T10:55:56.5610490-04:00"
 
 
-def temperature_rise_information(**overrides: Any) -> str:
-    """Build a TemperatureRiseInformation push, shaped like a real controller's."""
+def temperature_rise_information(**overrides: Any) -> dict[str, Any]:
+    """Build a TemperatureRiseInformation document, shaped like a real one."""
     document: dict[str, Any] = {
         "HeaterUUIDs": [],
         "UUID": "rise-1",
@@ -212,8 +216,8 @@ def temperature_rise_information(**overrides: Any) -> str:
         "TargetTemperature": 102.0,
         "SetPointChangedOrTStatWasTurnedOff": False,
         "StartDateTime": "2026-10-01T09:09:39.5644686-04:00",
-        "TargetEndDateTime": "2026-10-01T10:55:56.5610490-04:00",
-        "OriginalTargetEndDateTime": "2026-10-01T10:55:56.5610490-04:00",
+        "TargetEndDateTime": PREDICTED,
+        "OriginalTargetEndDateTime": PREDICTED,
         "ActualEndDateTime": UNSET_DATETIME,
         "ActualEndTemperature": 0.0,
         "EstimatedWattNeeded": 0,
@@ -223,56 +227,101 @@ def temperature_rise_information(**overrides: Any) -> str:
         "OriginalFutureHeatingEvent": None,
     }
     document.update(overrides)
+    return document
+
+
+def encoded(document: dict[str, Any]) -> str:
+    """Encode a document the way status pushes carry it: JSON in a string."""
     return json.dumps(document, indent=2)
+
+
+@pytest.mark.usefixtures("setup_integration")
+async def test_ready_time_sensor_created_when_first_reported(
+    hass: HomeAssistant,
+    fake_client: FakePoolsideClient,
+) -> None:
+    """The ready time sensor appears once the body of water reports a heat-up.
+
+    Like the chemistry sensors: a body without a heater never reports one.
+    """
+    assert hass.states.get(READY_TIME_ENTITY_ID) is None
+
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID,
+        "TemperatureRiseInformation",
+        encoded(temperature_rise_information()),
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.TIMESTAMP
 
 
 @pytest.mark.parametrize(
     ("raw_value", "expected_state"),
     [
         pytest.param(
-            temperature_rise_information(),
+            encoded(temperature_rise_information()),
             "2026-10-01T14:55:56+00:00",
             id="predicted",
         ),
         pytest.param(
-            temperature_rise_information(
-                TemperatureState="SAMPLING",
-                StartTemperature=None,
-                TargetEndDateTime=UNSET_DATETIME,
-                OriginalTargetEndDateTime=UNSET_DATETIME,
-            ),
-            STATE_UNKNOWN,
-            id="still-sampling",
+            temperature_rise_information(),
+            "2026-10-01T14:55:56+00:00",
+            id="native-document",
         ),
         pytest.param(
-            temperature_rise_information(
-                ActualEndDateTime="2026-10-01T10:54:10.0000000-04:00"
-            ),
+            encoded(temperature_rise_information(TemperatureState="SAMPLING")),
             STATE_UNKNOWN,
-            id="target-reached",
+            id="preliminary-while-sampling",
         ),
         pytest.param(
-            temperature_rise_information(TargetEndDateTime=None),
+            encoded(
+                temperature_rise_information(HeatingEventType="MAINTAIN_TEMPERATURE")
+            ),
+            STATE_UNKNOWN,
+            id="maintaining-temperature",
+        ),
+        pytest.param(
+            encoded(temperature_rise_information(HeatingEventType="LEARNING")),
+            STATE_UNKNOWN,
+            id="learning",
+        ),
+        pytest.param(
+            encoded(
+                temperature_rise_information(
+                    TargetEndDateTime="2026-10-01T09:10:00.0000000-04:00"
+                )
+            ),
+            STATE_UNKNOWN,
+            id="target-passed",
+        ),
+        pytest.param(
+            encoded(temperature_rise_information(TargetEndDateTime=UNSET_DATETIME)),
+            STATE_UNKNOWN,
+            id="unset-target",
+        ),
+        pytest.param(
+            encoded(temperature_rise_information(TargetEndDateTime=None)),
             STATE_UNKNOWN,
             id="no-target",
         ),
-        pytest.param("not json", STATE_UNKNOWN, id="malformed"),
         pytest.param("[]", STATE_UNKNOWN, id="not-a-document"),
     ],
 )
+@pytest.mark.freeze_time(NOW)
 @pytest.mark.usefixtures("setup_integration")
-async def test_ready_time_sensor_reflects_temperature_rise(
+async def test_ready_time_sensor_matches_the_app(
     hass: HomeAssistant,
     fake_client: FakePoolsideClient,
-    raw_value: str,
+    raw_value: Any,
     expected_state: str,
 ) -> None:
-    """The ready time is the controller's TargetEndDateTime, unknown while unset."""
-    state = hass.states.get(READY_TIME_ENTITY_ID)
-    assert state is not None
-    assert state.state == STATE_UNKNOWN
-    assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.TIMESTAMP
+    """The ready time is shown only when the vendor app shows one.
 
+    That is, for a sampled, normal heat-up whose target is still ahead.
+    """
     fake_client.set_status(
         TEST_BODY_OF_WATER_UUID, "TemperatureRiseInformation", raw_value
     )
@@ -283,23 +332,51 @@ async def test_ready_time_sensor_reflects_temperature_rise(
     assert state.state == expected_state
 
 
+@pytest.mark.freeze_time(NOW)
+@pytest.mark.usefixtures("setup_integration")
+async def test_ready_time_sensor_warns_on_unparsable_document(
+    hass: HomeAssistant,
+    fake_client: FakePoolsideClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unparsable document is logged and shown as unknown."""
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID,
+        "TemperatureRiseInformation",
+        encoded(temperature_rise_information()),
+    )
+    await hass.async_block_till_done()
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID, "TemperatureRiseInformation", "not json"
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+    assert "unparsable TemperatureRiseInformation" in caplog.text
+
+
+@pytest.mark.freeze_time(NOW)
 @pytest.mark.usefixtures("setup_integration")
 async def test_ready_time_sensor_follows_revisions(
     hass: HomeAssistant,
     fake_client: FakePoolsideClient,
 ) -> None:
-    """Revised predictions update the sensor, and clearing the field resets it."""
+    """Revised predictions update the sensor; clearing the field resets it."""
     fake_client.set_status(
         TEST_BODY_OF_WATER_UUID,
         "TemperatureRiseInformation",
-        temperature_rise_information(),
+        encoded(temperature_rise_information()),
     )
     await hass.async_block_till_done()
     fake_client.set_status(
         TEST_BODY_OF_WATER_UUID,
         "TemperatureRiseInformation",
-        temperature_rise_information(
-            TargetEndDateTime="2026-10-01T10:54:32.1000000-04:00"
+        encoded(
+            temperature_rise_information(
+                TargetEndDateTime="2026-10-01T10:54:32.1000000-04:00"
+            )
         ),
     )
     await hass.async_block_till_done()
@@ -309,6 +386,33 @@ async def test_ready_time_sensor_follows_revisions(
     assert state.state == "2026-10-01T14:54:32+00:00"
 
     fake_client.set_status(TEST_BODY_OF_WATER_UUID, "TemperatureRiseInformation", None)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(READY_TIME_ENTITY_ID)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+
+@pytest.mark.freeze_time(NOW)
+@pytest.mark.usefixtures("setup_integration")
+async def test_ready_time_sensor_clears_when_the_target_passes(
+    hass: HomeAssistant,
+    fake_client: FakePoolsideClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The ready time is cleared once it passes, even without a new push.
+
+    Otherwise it would linger and show as "x minutes ago".
+    """
+    fake_client.set_status(
+        TEST_BODY_OF_WATER_UUID,
+        "TemperatureRiseInformation",
+        encoded(temperature_rise_information()),
+    )
+    await hass.async_block_till_done()
+
+    freezer.move_to("2026-10-01T10:56:00-04:00")
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
     state = hass.states.get(READY_TIME_ENTITY_ID)
@@ -378,7 +482,6 @@ async def test_no_mode_sensor_without_site_uuid(
     assert set(hass.states.async_entity_ids("sensor")) == {
         ENTITY_ID,
         WATER_STATE_ENTITY_ID,
-        READY_TIME_ENTITY_ID,
         DISABLED_REASON_ENTITY_ID,
     }
 
