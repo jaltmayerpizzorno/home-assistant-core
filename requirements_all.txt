@@ -381,7 +381,7 @@ aiopegelonline==0.1.1
 aiopnsense==1.0.10
 
 # homeassistant.components.poolside
-aiopoolside==0.1.0
+aiopoolside==0.1.1
 
 # homeassistant.components.ptdevices
 aioptdevices==2026.03.2
