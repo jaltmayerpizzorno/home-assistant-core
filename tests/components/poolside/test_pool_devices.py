@@ -2,6 +2,7 @@
 
 import json
 from typing import Any
+from unittest.mock import patch
 
 from aiopoolside import PoolsideCommandError, PoolsideDevice
 import pytest
@@ -937,3 +938,37 @@ async def test_setup_succeeds_without_pool_device_support(
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
     assert mock_config_entry.runtime_data.pool_devices == []
+
+
+async def test_pool_devices_linked_by_device_id(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_poolside_client: FakePoolsideClient,
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Pool devices are linked to the controller by its device id.
+
+    `via_device` (by identifier) is deprecated and stops working in 2027.8.
+    """
+    calls: list[dict[str, Any]] = []
+    original = device_registry.async_get_or_create
+
+    def record(**kwargs: Any) -> dr.DeviceEntry:
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    with patch.object(device_registry, "async_get_or_create", side_effect=record):
+        await setup_entry(hass, mock_config_entry)
+
+    controller = device_registry.async_get_device({(DOMAIN, TEST_CONTROLLER_UUID)})
+    assert controller is not None
+    # The explicit registration that links the pump (entities attaching to it
+    # register it again, without a link).
+    [pump_call] = [
+        c
+        for c in calls
+        if c["identifiers"] == {(DOMAIN, PUMP_UUID)}
+        and ("via_device" in c or "via_device_id" in c)
+    ]
+    assert "via_device" not in pump_call
+    assert pump_call["via_device_id"] == controller.id
