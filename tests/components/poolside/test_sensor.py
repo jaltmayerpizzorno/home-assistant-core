@@ -264,6 +264,10 @@ async def test_no_mode_sensor_without_site_uuid(
         pytest.param('["WINTERIZED"]', "winterized", id="winterized"),
         pytest.param('["FREEZE_PROTECT"]', "freeze_protect", id="freeze-protect"),
         pytest.param('["cover-uuid-1"]', "pool_cover", id="pool-cover"),
+        # Observed on a real controller: while the pool's filter runs, the
+        # spa's controls list the pool filter's control UUID.
+        pytest.param('["light-1"]', "other_control", id="other-control"),
+        pytest.param('["light-1", "cover-uuid-1"]', "pool_cover", id="pool-cover-wins"),
         pytest.param(
             '["cover-uuid-1", "WINTERIZED"]', "winterized", id="winterized-wins"
         ),
@@ -279,8 +283,11 @@ async def test_disabled_reason_sensor_reflects_pushes(
 ) -> None:
     """The disabled reason sensor renders DisabledReasons pushes.
 
-    Unrecognized reasons are the UUID of the pool cover holding the control
-    closed; WINTERIZED wins when several reasons are listed at once.
+    A reason that is another control's UUID means that control is running
+    and holds this one off (e.g. the pool filter holding the spa off on a
+    shared pump); any other unrecognized reason is the UUID of the pool cover
+    holding the control closed. WINTERIZED wins when several reasons are
+    listed at once.
     """
     state = hass.states.get(DISABLED_REASON_ENTITY_ID)
     assert state is not None
@@ -290,6 +297,7 @@ async def test_disabled_reason_sensor_reflects_pushes(
         "winterized",
         "freeze_protect",
         "pool_cover",
+        "other_control",
     ]
 
     fake_client.set_status("heater-1", "DisabledReasons", raw_reasons)
